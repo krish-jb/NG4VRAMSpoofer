@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="NG4VRAMSpoofer/NG4VRAMSpoofer.vcxproj" Id="f5a65eec-4e38-432f-8637-ee6bf09560f0" />
+</Solution>
