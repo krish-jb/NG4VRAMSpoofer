@@ -3,13 +3,10 @@
 #include <dxgi.h>
 #include <dxgi1_2.h>
 #include <dxgi1_4.h>
-#include <iostream>
-#include <fstream>
 #include <set>
 #include <mutex>
 #include <atomic>
 #include "MinHook.h"
-#include <string>
 
 #pragma comment(lib, "dxgi.lib")
 
@@ -18,15 +15,6 @@ std::set<void*> hookedFunctions;
 std::atomic<bool> g_adapterHooked{ false };
 std::atomic<bool> g_initComplete{ false };
 
-// ===== Logging: only active during init =====
-void Log(const char* text) {
-    if (g_initComplete.load(std::memory_order_relaxed)) return; // silence after init
-    std::lock_guard<std::mutex> lock(spooferMutex);
-    std::ofstream logFile("spoofer_log.txt", std::ios::app);
-    if (logFile.is_open()) {
-        logFile << text << "\n";
-    }
-}
 
 typedef HRESULT(STDMETHODCALLTYPE* GetDesc_t)(IDXGIAdapter*, DXGI_ADAPTER_DESC*);
 typedef HRESULT(STDMETHODCALLTYPE* GetDesc1_t)(IDXGIAdapter1*, DXGI_ADAPTER_DESC1*);
@@ -67,11 +55,9 @@ bool SafeCreateHook(void* targetFunc, LPVOID detourFunc, LPVOID* originalFunc, c
         MH_STATUS es = MH_EnableHook(targetFunc);
         if (es == MH_OK) {
             hookedFunctions.insert(targetFunc);
-            Log((std::string("SUCCESS: Hooked ") + name).c_str());
             return true;
         }
     }
-    Log((std::string("FAIL: ") + name + " - " + MH_StatusToString(status)).c_str());
     return false;
 }
 
@@ -119,16 +105,13 @@ void HookAdapterVtable(IDXGIAdapter1* pAdapter) {
 
     char buf[256];
     sprintf_s(buf, "Adapter vtable base=%p [8]=%p [12]=%p", vtable, vtable[8], vtable[12]);
-    Log(buf);
 
     DXGI_ADAPTER_DESC1 desc = {};
     HRESULT hr = pAdapter->GetDesc1(&desc);
     if (FAILED(hr)) {
-        Log("GetDesc1 call FAILED - skipping");
         return;
     }
     sprintf_s(buf, "Real GPU: %ws, VRAM: %llu MB", desc.Description, desc.DedicatedVideoMemory / (1024 * 1024));
-    Log(buf);
 
     SafeCreateHook(vtable[8], (LPVOID)&Hooked_GetDesc, (LPVOID*)&oGetDesc, "GetDesc[8]");
     SafeCreateHook(vtable[12], (LPVOID)&Hooked_GetDesc1, (LPVOID*)&oGetDesc1, "GetDesc1[12]");
@@ -145,7 +128,6 @@ void HookAdapterVtable(IDXGIAdapter1* pAdapter) {
 
 // ===== Factory hooks =====
 HRESULT WINAPI Hooked_CreateDXGIFactory1(REFIID riid, void** ppFactory) {
-    Log("Hooked_CreateDXGIFactory1 CALLED");
     HRESULT hr = oCreateDXGIFactory1(riid, ppFactory);
     if (SUCCEEDED(hr) && ppFactory && *ppFactory && !g_adapterHooked.load()) {
         __try {
@@ -160,14 +142,12 @@ HRESULT WINAPI Hooked_CreateDXGIFactory1(REFIID riid, void** ppFactory) {
             }
         }
         __except (EXCEPTION_EXECUTE_HANDLER) {
-            Log("EXCEPTION in Factory1 adapter hook");
         }
     }
     return hr;
 }
 
 HRESULT WINAPI Hooked_CreateDXGIFactory2(UINT Flags, REFIID riid, void** ppFactory) {
-    Log("Hooked_CreateDXGIFactory2 CALLED");
     HRESULT hr = oCreateDXGIFactory2(Flags, riid, ppFactory);
     if (SUCCEEDED(hr) && ppFactory && *ppFactory && !g_adapterHooked.load()) {
         __try {
@@ -182,7 +162,6 @@ HRESULT WINAPI Hooked_CreateDXGIFactory2(UINT Flags, REFIID riid, void** ppFacto
             }
         }
         __except (EXCEPTION_EXECUTE_HANDLER) {
-            Log("EXCEPTION in Factory2 adapter hook");
         }
     }
     return hr;
@@ -190,24 +169,19 @@ HRESULT WINAPI Hooked_CreateDXGIFactory2(UINT Flags, REFIID riid, void** ppFacto
 
 DWORD WINAPI InitHookThread(LPVOID lpParam) {
     Sleep(50);
-    Log("=== Spoofer v9 Init ===");
 
     if (MH_Initialize() != MH_OK) {
-        Log("MinHook FAILED");
         return 1;
     }
-    Log("MinHook OK");
 
     MH_CreateHookApi(L"dxgi.dll", "CreateDXGIFactory1",
         (LPVOID)&Hooked_CreateDXGIFactory1, (LPVOID*)&oCreateDXGIFactory1);
     MH_CreateHookApi(L"dxgi.dll", "CreateDXGIFactory2",
         (LPVOID)&Hooked_CreateDXGIFactory2, (LPVOID*)&oCreateDXGIFactory2);
     MH_EnableHook(MH_ALL_HOOKS);
-    Log("API hooks enabled");
 
     Sleep(3000);
     if (!g_adapterHooked.load()) {
-        Log("No factory hook fired - trying direct fallback");
         if (oCreateDXGIFactory1) {
             IDXGIFactory1* pFactory = nullptr;
             if (SUCCEEDED(oCreateDXGIFactory1(__uuidof(IDXGIFactory1), (void**)&pFactory))) {
@@ -222,7 +196,6 @@ DWORD WINAPI InitHookThread(LPVOID lpParam) {
     }
 
     g_initComplete.store(true); // disable logging from here on
-    Log("=== Init complete, logging disabled ===");
     return 0;
 }
 
