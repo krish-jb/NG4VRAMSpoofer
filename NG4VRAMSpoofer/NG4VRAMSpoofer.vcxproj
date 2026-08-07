@@ -151,6 +151,7 @@
       <EnableUAC>false</EnableUAC>
       <AdditionalDependencies>"C:\Users\krish\Documents\Programs\NG4VRAMSpoofer\NG4VRAMSpoofer\packages\minhook\lib\libMinHook.x64.lib";%(AdditionalDependencies)</AdditionalDependencies>
       <LinkTimeCodeGeneration>UseLinkTimeCodeGeneration</LinkTimeCodeGeneration>
+      <ModuleDefinitionFile>C:\Users\krish\Documents\Programs\NG4VRAMSpoofer\NG4VRAMSpoofer\NG4VRAMSpoofer\dxgi.def</ModuleDefinitionFile>
     </Link>
     <Manifest>
       <EnableSegmentHeap>true</EnableSegmentHeap>
@@ -168,6 +169,9 @@
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">Create</PrecompiledHeader>
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">Create</PrecompiledHeader>
     </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="dxgi.def" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets" />

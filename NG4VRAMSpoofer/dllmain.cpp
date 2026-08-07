@@ -1,41 +1,63 @@
 #include "pch.h"
+
+// Suppress redefinition linkage warnings BEFORE including dxgi headers
+#pragma warning(disable: 4390) // empty controlled statement
+
 #include <Windows.h>
 #include <dxgi.h>
 #include <dxgi1_2.h>
 #include <dxgi1_4.h>
 #include <set>
-#include <mutex>
 #include <atomic>
 #include "MinHook.h"
 
-#pragma comment(lib, "dxgi.lib")
 
-std::mutex spooferMutex;
-std::set<void*> hookedFunctions;
-std::atomic<bool> g_adapterHooked{ false };
-std::atomic<bool> g_initComplete{ false };
+// DO NOT link dxgi.lib
+// NO: #pragma comment(lib, "dxgi.lib")
 
+#pragma warning(disable: 4273)
 
-typedef HRESULT(STDMETHODCALLTYPE* GetDesc_t)(IDXGIAdapter*, DXGI_ADAPTER_DESC*);
-typedef HRESULT(STDMETHODCALLTYPE* GetDesc1_t)(IDXGIAdapter1*, DXGI_ADAPTER_DESC1*);
-typedef HRESULT(STDMETHODCALLTYPE* QueryVideoMemoryInfo_t)(IDXGIAdapter3*, UINT, DXGI_MEMORY_SEGMENT_GROUP, DXGI_QUERY_VIDEO_MEMORY_INFO*);
-typedef HRESULT(WINAPI* CreateDXGIFactory1_t)(REFIID, void**);
-typedef HRESULT(WINAPI* CreateDXGIFactory2_t)(UINT, REFIID, void**);
+// ===== Real system DXGI =====
+HMODULE g_hRealDxgi = NULL;
 
-GetDesc_t oGetDesc = nullptr;
-GetDesc1_t oGetDesc1 = nullptr;
-QueryVideoMemoryInfo_t oQueryVideoMemoryInfo = nullptr;
-CreateDXGIFactory1_t oCreateDXGIFactory1 = nullptr;
-CreateDXGIFactory2_t oCreateDXGIFactory2 = nullptr;
+typedef HRESULT(WINAPI* PFN_CreateDXGIFactory)(REFIID, void**);
+typedef HRESULT(WINAPI* PFN_CreateDXGIFactory1)(REFIID, void**);
+typedef HRESULT(WINAPI* PFN_CreateDXGIFactory2)(UINT, REFIID, void**);
+typedef HRESULT(WINAPI* PFN_DXGIGetDebugInterface1)(UINT, REFIID, void**);
+typedef HRESULT(WINAPI* PFN_DXGIDeclareAdapterRemovalSupport)();
 
+PFN_CreateDXGIFactory       pReal_CreateDXGIFactory = nullptr;
+PFN_CreateDXGIFactory1      pReal_CreateDXGIFactory1 = nullptr;
+PFN_CreateDXGIFactory2      pReal_CreateDXGIFactory2 = nullptr;
+PFN_DXGIGetDebugInterface1  pReal_DXGIGetDebugInterface1 = nullptr;
+PFN_DXGIDeclareAdapterRemovalSupport pReal_DXGIDeclareAdapterRemovalSupport = nullptr;
+
+void LoadRealDxgi() {
+    if (g_hRealDxgi) return;
+    char sysPath[MAX_PATH];
+    GetSystemDirectoryA(sysPath, MAX_PATH);
+    strcat_s(sysPath, "\\dxgi.dll");
+    g_hRealDxgi = LoadLibraryA(sysPath);
+    if (g_hRealDxgi) {
+        pReal_CreateDXGIFactory = (PFN_CreateDXGIFactory)GetProcAddress(g_hRealDxgi, "CreateDXGIFactory");
+        pReal_CreateDXGIFactory1 = (PFN_CreateDXGIFactory1)GetProcAddress(g_hRealDxgi, "CreateDXGIFactory1");
+        pReal_CreateDXGIFactory2 = (PFN_CreateDXGIFactory2)GetProcAddress(g_hRealDxgi, "CreateDXGIFactory2");
+        pReal_DXGIGetDebugInterface1 = (PFN_DXGIGetDebugInterface1)GetProcAddress(g_hRealDxgi, "DXGIGetDebugInterface1");
+        pReal_DXGIDeclareAdapterRemovalSupport = (PFN_DXGIDeclareAdapterRemovalSupport)GetProcAddress(g_hRealDxgi, "DXGIDeclareAdapterRemovalSupport");
+    }
+}
+
+// ===== Spoofing =====
 const UINT64 EIGHT_GB = (UINT64)8 * 1024 * 1024 * 1024;
 const UINT64 FOUR_GB = (UINT64)4 * 1024 * 1024 * 1024;
 
-// Pre-built spoofed descriptions — filled once, returned every time
 static DXGI_ADAPTER_DESC  g_spoofedDesc = {};
 static DXGI_ADAPTER_DESC1 g_spoofedDesc1 = {};
-static bool g_descCached = false;
-static bool g_desc1Cached = false;
+static std::atomic<bool> g_descCached{ false };
+static std::atomic<bool> g_desc1Cached{ false };
+static std::atomic<bool> g_adapterHooked{ false };
+static std::atomic<bool> g_mhReady{ false };
+static std::set<void*> hookedFunctions;
 
 template <typename T>
 void ApplySpoof(T* pDesc) {
@@ -47,28 +69,34 @@ void ApplySpoof(T* pDesc) {
     wcscpy_s(pDesc->Description, L"NVIDIA GeForce RTX 3060");
 }
 
-bool SafeCreateHook(void* targetFunc, LPVOID detourFunc, LPVOID* originalFunc, const char* name) {
-    if (!targetFunc) return false;
-    if (hookedFunctions.find(targetFunc) != hookedFunctions.end()) return false;
-    MH_STATUS status = MH_CreateHook(targetFunc, detourFunc, originalFunc);
-    if (status == MH_OK) {
-        MH_STATUS es = MH_EnableHook(targetFunc);
-        if (es == MH_OK) {
-            hookedFunctions.insert(targetFunc);
+// ===== MinHook vtable hooks =====
+typedef HRESULT(STDMETHODCALLTYPE* GetDesc_t)(IDXGIAdapter*, DXGI_ADAPTER_DESC*);
+typedef HRESULT(STDMETHODCALLTYPE* GetDesc1_t)(IDXGIAdapter1*, DXGI_ADAPTER_DESC1*);
+typedef HRESULT(STDMETHODCALLTYPE* QueryVideoMemoryInfo_t)(IDXGIAdapter3*, UINT, DXGI_MEMORY_SEGMENT_GROUP, DXGI_QUERY_VIDEO_MEMORY_INFO*);
+
+GetDesc_t oGetDesc = nullptr;
+GetDesc1_t oGetDesc1 = nullptr;
+QueryVideoMemoryInfo_t oQueryVideoMemoryInfo = nullptr;
+
+bool SafeCreateHook(void* target, LPVOID detour, LPVOID* original, const char* name) {
+    if (!target || !g_mhReady.load()) return false;
+    if (hookedFunctions.find(target) != hookedFunctions.end()) return false;
+    if (MH_CreateHook(target, detour, original) == MH_OK) {
+        if (MH_EnableHook(target) == MH_OK) {
+            hookedFunctions.insert(target);
             return true;
         }
     }
     return false;
 }
 
-// ===== Hooked functions — no logging, no mutex, just memcpy =====
 HRESULT STDMETHODCALLTYPE Hooked_GetDesc(IDXGIAdapter* pAdapter, DXGI_ADAPTER_DESC* pDesc) {
     HRESULT hr = oGetDesc(pAdapter, pDesc);
     if (SUCCEEDED(hr) && pDesc) {
-        if (!g_descCached) {
+        if (!g_descCached.load()) {
             g_spoofedDesc = *pDesc;
             ApplySpoof(&g_spoofedDesc);
-            g_descCached = true;
+            g_descCached.store(true);
         }
         *pDesc = g_spoofedDesc;
     }
@@ -78,18 +106,18 @@ HRESULT STDMETHODCALLTYPE Hooked_GetDesc(IDXGIAdapter* pAdapter, DXGI_ADAPTER_DE
 HRESULT STDMETHODCALLTYPE Hooked_GetDesc1(IDXGIAdapter1* pAdapter, DXGI_ADAPTER_DESC1* pDesc) {
     HRESULT hr = oGetDesc1(pAdapter, pDesc);
     if (SUCCEEDED(hr) && pDesc) {
-        if (!g_desc1Cached) {
+        if (!g_desc1Cached.load()) {
             g_spoofedDesc1 = *pDesc;
             ApplySpoof(&g_spoofedDesc1);
-            g_desc1Cached = true;
+            g_desc1Cached.store(true);
         }
         *pDesc = g_spoofedDesc1;
     }
     return hr;
 }
 
-HRESULT STDMETHODCALLTYPE Hooked_QueryVideoMemoryInfo(IDXGIAdapter3* pAdapter, UINT NodeIndex, DXGI_MEMORY_SEGMENT_GROUP MemorySegmentGroup, DXGI_QUERY_VIDEO_MEMORY_INFO* pInfo) {
-    HRESULT hr = oQueryVideoMemoryInfo(pAdapter, NodeIndex, MemorySegmentGroup, pInfo);
+HRESULT STDMETHODCALLTYPE Hooked_QueryVideoMemoryInfo(IDXGIAdapter3* pAdapter, UINT NodeIndex, DXGI_MEMORY_SEGMENT_GROUP Grp, DXGI_QUERY_VIDEO_MEMORY_INFO* pInfo) {
+    HRESULT hr = oQueryVideoMemoryInfo(pAdapter, NodeIndex, Grp, pInfo);
     if (SUCCEEDED(hr) && pInfo) {
         pInfo->Budget = EIGHT_GB;
         pInfo->CurrentUsage = 1024 * 1024;
@@ -98,20 +126,9 @@ HRESULT STDMETHODCALLTYPE Hooked_QueryVideoMemoryInfo(IDXGIAdapter3* pAdapter, U
     return hr;
 }
 
-// ===== Hook adapter vtable =====
 void HookAdapterVtable(IDXGIAdapter1* pAdapter) {
     if (!pAdapter || g_adapterHooked.load()) return;
     void** vtable = *(void***)pAdapter;
-
-    char buf[256];
-    sprintf_s(buf, "Adapter vtable base=%p [8]=%p [12]=%p", vtable, vtable[8], vtable[12]);
-
-    DXGI_ADAPTER_DESC1 desc = {};
-    HRESULT hr = pAdapter->GetDesc1(&desc);
-    if (FAILED(hr)) {
-        return;
-    }
-    sprintf_s(buf, "Real GPU: %ws, VRAM: %llu MB", desc.Description, desc.DedicatedVideoMemory / (1024 * 1024));
 
     SafeCreateHook(vtable[8], (LPVOID)&Hooked_GetDesc, (LPVOID*)&oGetDesc, "GetDesc[8]");
     SafeCreateHook(vtable[12], (LPVOID)&Hooked_GetDesc1, (LPVOID*)&oGetDesc1, "GetDesc1[12]");
@@ -126,87 +143,77 @@ void HookAdapterVtable(IDXGIAdapter1* pAdapter) {
     g_adapterHooked.store(true);
 }
 
-// ===== Factory hooks =====
-HRESULT WINAPI Hooked_CreateDXGIFactory1(REFIID riid, void** ppFactory) {
-    HRESULT hr = oCreateDXGIFactory1(riid, ppFactory);
-    if (SUCCEEDED(hr) && ppFactory && *ppFactory && !g_adapterHooked.load()) {
-        __try {
-            IDXGIFactory1* pFactory = nullptr;
-            if (SUCCEEDED(((IUnknown*)*ppFactory)->QueryInterface(__uuidof(IDXGIFactory1), (void**)&pFactory))) {
-                IDXGIAdapter1* pAdapter = nullptr;
-                if (SUCCEEDED(pFactory->EnumAdapters1(0, &pAdapter))) {
-                    HookAdapterVtable(pAdapter);
-                    pAdapter->Release();
-                }
-                pFactory->Release();
+// Helper: grab adapter from factory and hook it
+void TryHookFromFactory(void* pFactoryVoid) {
+    if (!pFactoryVoid || g_adapterHooked.load()) return;
+    __try {
+        IDXGIFactory1* pFactory = nullptr;
+        if (SUCCEEDED(((IUnknown*)pFactoryVoid)->QueryInterface(__uuidof(IDXGIFactory1), (void**)&pFactory))) {
+            IDXGIAdapter1* pAdapter = nullptr;
+            if (SUCCEEDED(pFactory->EnumAdapters1(0, &pAdapter))) {
+                HookAdapterVtable(pAdapter);
+                pAdapter->Release();
             }
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER) {
+            pFactory->Release();
         }
     }
-    return hr;
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
 
-HRESULT WINAPI Hooked_CreateDXGIFactory2(UINT Flags, REFIID riid, void** ppFactory) {
-    HRESULT hr = oCreateDXGIFactory2(Flags, riid, ppFactory);
-    if (SUCCEEDED(hr) && ppFactory && *ppFactory && !g_adapterHooked.load()) {
-        __try {
-            IDXGIFactory1* pFactory = nullptr;
-            if (SUCCEEDED(((IUnknown*)*ppFactory)->QueryInterface(__uuidof(IDXGIFactory1), (void**)&pFactory))) {
-                IDXGIAdapter1* pAdapter = nullptr;
-                if (SUCCEEDED(pFactory->EnumAdapters1(0, &pAdapter))) {
-                    HookAdapterVtable(pAdapter);
-                    pAdapter->Release();
-                }
-                pFactory->Release();
-            }
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER) {
-        }
-    }
-    return hr;
-}
+// ===== Exported DXGI functions =====
+extern "C" {
 
-DWORD WINAPI InitHookThread(LPVOID lpParam) {
-    Sleep(50);
-
-    if (MH_Initialize() != MH_OK) {
-        return 1;
+    HRESULT WINAPI Proxy_CreateDXGIFactory(REFIID riid, void** ppFactory) {
+        LoadRealDxgi();
+        if (!pReal_CreateDXGIFactory) return E_FAIL;
+        HRESULT hr = pReal_CreateDXGIFactory(riid, ppFactory);
+        if (SUCCEEDED(hr)) TryHookFromFactory(*ppFactory);
+        return hr;
     }
 
-    MH_CreateHookApi(L"dxgi.dll", "CreateDXGIFactory1",
-        (LPVOID)&Hooked_CreateDXGIFactory1, (LPVOID*)&oCreateDXGIFactory1);
-    MH_CreateHookApi(L"dxgi.dll", "CreateDXGIFactory2",
-        (LPVOID)&Hooked_CreateDXGIFactory2, (LPVOID*)&oCreateDXGIFactory2);
-    MH_EnableHook(MH_ALL_HOOKS);
-
-    Sleep(3000);
-    if (!g_adapterHooked.load()) {
-        if (oCreateDXGIFactory1) {
-            IDXGIFactory1* pFactory = nullptr;
-            if (SUCCEEDED(oCreateDXGIFactory1(__uuidof(IDXGIFactory1), (void**)&pFactory))) {
-                IDXGIAdapter1* pAdapter = nullptr;
-                if (SUCCEEDED(pFactory->EnumAdapters1(0, &pAdapter))) {
-                    HookAdapterVtable(pAdapter);
-                    pAdapter->Release();
-                }
-                pFactory->Release();
-            }
-        }
+    HRESULT WINAPI Proxy_CreateDXGIFactory1(REFIID riid, void** ppFactory) {
+        LoadRealDxgi();
+        if (!pReal_CreateDXGIFactory1) return E_FAIL;
+        HRESULT hr = pReal_CreateDXGIFactory1(riid, ppFactory);
+        if (SUCCEEDED(hr)) TryHookFromFactory(*ppFactory);
+        return hr;
     }
 
-    g_initComplete.store(true); // disable logging from here on
-    return 0;
-}
+    HRESULT WINAPI Proxy_CreateDXGIFactory2(UINT Flags, REFIID riid, void** ppFactory) {
+        LoadRealDxgi();
+        if (!pReal_CreateDXGIFactory2) return E_FAIL;
+        HRESULT hr = pReal_CreateDXGIFactory2(Flags, riid, ppFactory);
+        if (SUCCEEDED(hr)) TryHookFromFactory(*ppFactory);
+        return hr;
+    }
 
+    HRESULT WINAPI Proxy_DXGIGetDebugInterface1(UINT Flags, REFIID riid, void** ppDebug) {
+        LoadRealDxgi();
+        return pReal_DXGIGetDebugInterface1 ? pReal_DXGIGetDebugInterface1(Flags, riid, ppDebug) : E_FAIL;
+    }
+
+    HRESULT WINAPI Proxy_DXGIDeclareAdapterRemovalSupport() {
+        LoadRealDxgi();
+        return pReal_DXGIDeclareAdapterRemovalSupport ? pReal_DXGIDeclareAdapterRemovalSupport() : E_FAIL;
+    }
+
+} // extern "C"
+
+// ===== DllMain =====
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {
     if (ul_reason_for_call == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hModule);
-        CreateThread(NULL, 0, InitHookThread, NULL, 0, NULL);
+        LoadRealDxgi();
+        if (MH_Initialize() == MH_OK) {
+            g_mhReady.store(true);
+        }
     }
     else if (ul_reason_for_call == DLL_PROCESS_DETACH) {
-        MH_DisableHook(MH_ALL_HOOKS);
-        MH_Uninitialize();
+        if (g_mhReady.load()) {
+            MH_DisableHook(MH_ALL_HOOKS);
+            MH_Uninitialize();
+        }
+        if (g_hRealDxgi) FreeLibrary(g_hRealDxgi);
     }
     return TRUE;
 }
