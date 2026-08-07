@@ -1,24 +1,16 @@
 #include "pch.h"
 
-// Suppress redefinition linkage warnings BEFORE including dxgi headers
-#pragma warning(disable: 4390) // empty controlled statement
+#pragma warning(disable: 4390)
 
 #include <Windows.h>
 #include <dxgi.h>
 #include <dxgi1_2.h>
 #include <dxgi1_4.h>
-#include <set>
 #include <atomic>
 #include "MinHook.h"
 
-
-// DO NOT link dxgi.lib
-// NO: #pragma comment(lib, "dxgi.lib")
-
-#pragma warning(disable: 4273)
-
 // ===== Real system DXGI =====
-HMODULE g_hRealDxgi = NULL;
+static HMODULE g_hRealDxgi = NULL;
 
 typedef HRESULT(WINAPI* PFN_CreateDXGIFactory)(REFIID, void**);
 typedef HRESULT(WINAPI* PFN_CreateDXGIFactory1)(REFIID, void**);
@@ -26,11 +18,11 @@ typedef HRESULT(WINAPI* PFN_CreateDXGIFactory2)(UINT, REFIID, void**);
 typedef HRESULT(WINAPI* PFN_DXGIGetDebugInterface1)(UINT, REFIID, void**);
 typedef HRESULT(WINAPI* PFN_DXGIDeclareAdapterRemovalSupport)();
 
-PFN_CreateDXGIFactory       pReal_CreateDXGIFactory = nullptr;
-PFN_CreateDXGIFactory1      pReal_CreateDXGIFactory1 = nullptr;
-PFN_CreateDXGIFactory2      pReal_CreateDXGIFactory2 = nullptr;
-PFN_DXGIGetDebugInterface1  pReal_DXGIGetDebugInterface1 = nullptr;
-PFN_DXGIDeclareAdapterRemovalSupport pReal_DXGIDeclareAdapterRemovalSupport = nullptr;
+static PFN_CreateDXGIFactory       pReal_CreateDXGIFactory = nullptr;
+static PFN_CreateDXGIFactory1      pReal_CreateDXGIFactory1 = nullptr;
+static PFN_CreateDXGIFactory2      pReal_CreateDXGIFactory2 = nullptr;
+static PFN_DXGIGetDebugInterface1  pReal_DXGIGetDebugInterface1 = nullptr;
+static PFN_DXGIDeclareAdapterRemovalSupport pReal_DXGIDeclareAdapterRemovalSupport = nullptr;
 
 void LoadRealDxgi() {
     if (g_hRealDxgi) return;
@@ -48,8 +40,8 @@ void LoadRealDxgi() {
 }
 
 // ===== Spoofing =====
-const UINT64 EIGHT_GB = (UINT64)8 * 1024 * 1024 * 1024;
-const UINT64 FOUR_GB = (UINT64)4 * 1024 * 1024 * 1024;
+static constexpr UINT64 EIGHT_GB = (UINT64)8 * 1024 * 1024 * 1024;
+static constexpr UINT64 FOUR_GB = (UINT64)4 * 1024 * 1024 * 1024;
 
 static DXGI_ADAPTER_DESC  g_spoofedDesc = {};
 static DXGI_ADAPTER_DESC1 g_spoofedDesc1 = {};
@@ -57,10 +49,13 @@ static std::atomic<bool> g_descCached{ false };
 static std::atomic<bool> g_desc1Cached{ false };
 static std::atomic<bool> g_adapterHooked{ false };
 static std::atomic<bool> g_mhReady{ false };
-static std::set<void*> hookedFunctions;
+
+// Fixed-size hook tracking — no heap allocation
+static void* g_hookedTargets[4] = {};
+static int   g_hookedCount = 0;
 
 template <typename T>
-void ApplySpoof(T* pDesc) {
+__forceinline void ApplySpoof(T* pDesc) {
     pDesc->DedicatedVideoMemory = EIGHT_GB;
     pDesc->DedicatedSystemMemory = 0;
     pDesc->SharedSystemMemory = FOUR_GB;
@@ -74,16 +69,23 @@ typedef HRESULT(STDMETHODCALLTYPE* GetDesc_t)(IDXGIAdapter*, DXGI_ADAPTER_DESC*)
 typedef HRESULT(STDMETHODCALLTYPE* GetDesc1_t)(IDXGIAdapter1*, DXGI_ADAPTER_DESC1*);
 typedef HRESULT(STDMETHODCALLTYPE* QueryVideoMemoryInfo_t)(IDXGIAdapter3*, UINT, DXGI_MEMORY_SEGMENT_GROUP, DXGI_QUERY_VIDEO_MEMORY_INFO*);
 
-GetDesc_t oGetDesc = nullptr;
-GetDesc1_t oGetDesc1 = nullptr;
-QueryVideoMemoryInfo_t oQueryVideoMemoryInfo = nullptr;
+static GetDesc_t oGetDesc = nullptr;
+static GetDesc1_t oGetDesc1 = nullptr;
+static QueryVideoMemoryInfo_t oQueryVideoMemoryInfo = nullptr;
 
-bool SafeCreateHook(void* target, LPVOID detour, LPVOID* original, const char* name) {
-    if (!target || !g_mhReady.load()) return false;
-    if (hookedFunctions.find(target) != hookedFunctions.end()) return false;
+static bool IsAlreadyHooked(void* target) {
+    for (int i = 0; i < g_hookedCount; i++) {
+        if (g_hookedTargets[i] == target) return true;
+    }
+    return false;
+}
+
+static bool SafeCreateHook(void* target, LPVOID detour, LPVOID* original) {
+    if (!target || !g_mhReady.load(std::memory_order_relaxed)) return false;
+    if (IsAlreadyHooked(target)) return false;
     if (MH_CreateHook(target, detour, original) == MH_OK) {
         if (MH_EnableHook(target) == MH_OK) {
-            hookedFunctions.insert(target);
+            if (g_hookedCount < 4) g_hookedTargets[g_hookedCount++] = target;
             return true;
         }
     }
@@ -93,10 +95,10 @@ bool SafeCreateHook(void* target, LPVOID detour, LPVOID* original, const char* n
 HRESULT STDMETHODCALLTYPE Hooked_GetDesc(IDXGIAdapter* pAdapter, DXGI_ADAPTER_DESC* pDesc) {
     HRESULT hr = oGetDesc(pAdapter, pDesc);
     if (SUCCEEDED(hr) && pDesc) {
-        if (!g_descCached.load()) {
+        if (!g_descCached.load(std::memory_order_relaxed)) {
             g_spoofedDesc = *pDesc;
             ApplySpoof(&g_spoofedDesc);
-            g_descCached.store(true);
+            g_descCached.store(true, std::memory_order_relaxed);
         }
         *pDesc = g_spoofedDesc;
     }
@@ -106,10 +108,10 @@ HRESULT STDMETHODCALLTYPE Hooked_GetDesc(IDXGIAdapter* pAdapter, DXGI_ADAPTER_DE
 HRESULT STDMETHODCALLTYPE Hooked_GetDesc1(IDXGIAdapter1* pAdapter, DXGI_ADAPTER_DESC1* pDesc) {
     HRESULT hr = oGetDesc1(pAdapter, pDesc);
     if (SUCCEEDED(hr) && pDesc) {
-        if (!g_desc1Cached.load()) {
+        if (!g_desc1Cached.load(std::memory_order_relaxed)) {
             g_spoofedDesc1 = *pDesc;
             ApplySpoof(&g_spoofedDesc1);
-            g_desc1Cached.store(true);
+            g_desc1Cached.store(true, std::memory_order_relaxed);
         }
         *pDesc = g_spoofedDesc1;
     }
@@ -126,26 +128,25 @@ HRESULT STDMETHODCALLTYPE Hooked_QueryVideoMemoryInfo(IDXGIAdapter3* pAdapter, U
     return hr;
 }
 
-void HookAdapterVtable(IDXGIAdapter1* pAdapter) {
-    if (!pAdapter || g_adapterHooked.load()) return;
+static void HookAdapterVtable(IDXGIAdapter1* pAdapter) {
+    if (!pAdapter || g_adapterHooked.load(std::memory_order_relaxed)) return;
     void** vtable = *(void***)pAdapter;
 
-    SafeCreateHook(vtable[8], (LPVOID)&Hooked_GetDesc, (LPVOID*)&oGetDesc, "GetDesc[8]");
-    SafeCreateHook(vtable[12], (LPVOID)&Hooked_GetDesc1, (LPVOID*)&oGetDesc1, "GetDesc1[12]");
+    SafeCreateHook(vtable[8], (LPVOID)&Hooked_GetDesc, (LPVOID*)&oGetDesc);
+    SafeCreateHook(vtable[12], (LPVOID)&Hooked_GetDesc1, (LPVOID*)&oGetDesc1);
 
     IDXGIAdapter3* pAdapter3 = nullptr;
     if (SUCCEEDED(pAdapter->QueryInterface(__uuidof(IDXGIAdapter3), (void**)&pAdapter3))) {
         void** vt3 = *(void***)pAdapter3;
-        SafeCreateHook(vt3[14], (LPVOID)&Hooked_QueryVideoMemoryInfo, (LPVOID*)&oQueryVideoMemoryInfo, "QueryVideoMemoryInfo[14]");
+        SafeCreateHook(vt3[14], (LPVOID)&Hooked_QueryVideoMemoryInfo, (LPVOID*)&oQueryVideoMemoryInfo);
         pAdapter3->Release();
     }
 
-    g_adapterHooked.store(true);
+    g_adapterHooked.store(true, std::memory_order_relaxed);
 }
 
-// Helper: grab adapter from factory and hook it
-void TryHookFromFactory(void* pFactoryVoid) {
-    if (!pFactoryVoid || g_adapterHooked.load()) return;
+static void TryHookFromFactory(void* pFactoryVoid) {
+    if (!pFactoryVoid || g_adapterHooked.load(std::memory_order_relaxed)) return;
     __try {
         IDXGIFactory1* pFactory = nullptr;
         if (SUCCEEDED(((IUnknown*)pFactoryVoid)->QueryInterface(__uuidof(IDXGIFactory1), (void**)&pFactory))) {
@@ -164,7 +165,6 @@ void TryHookFromFactory(void* pFactoryVoid) {
 extern "C" {
 
     HRESULT WINAPI Proxy_CreateDXGIFactory(REFIID riid, void** ppFactory) {
-        LoadRealDxgi();
         if (!pReal_CreateDXGIFactory) return E_FAIL;
         HRESULT hr = pReal_CreateDXGIFactory(riid, ppFactory);
         if (SUCCEEDED(hr)) TryHookFromFactory(*ppFactory);
@@ -172,7 +172,6 @@ extern "C" {
     }
 
     HRESULT WINAPI Proxy_CreateDXGIFactory1(REFIID riid, void** ppFactory) {
-        LoadRealDxgi();
         if (!pReal_CreateDXGIFactory1) return E_FAIL;
         HRESULT hr = pReal_CreateDXGIFactory1(riid, ppFactory);
         if (SUCCEEDED(hr)) TryHookFromFactory(*ppFactory);
@@ -180,7 +179,6 @@ extern "C" {
     }
 
     HRESULT WINAPI Proxy_CreateDXGIFactory2(UINT Flags, REFIID riid, void** ppFactory) {
-        LoadRealDxgi();
         if (!pReal_CreateDXGIFactory2) return E_FAIL;
         HRESULT hr = pReal_CreateDXGIFactory2(Flags, riid, ppFactory);
         if (SUCCEEDED(hr)) TryHookFromFactory(*ppFactory);
@@ -188,12 +186,10 @@ extern "C" {
     }
 
     HRESULT WINAPI Proxy_DXGIGetDebugInterface1(UINT Flags, REFIID riid, void** ppDebug) {
-        LoadRealDxgi();
         return pReal_DXGIGetDebugInterface1 ? pReal_DXGIGetDebugInterface1(Flags, riid, ppDebug) : E_FAIL;
     }
 
     HRESULT WINAPI Proxy_DXGIDeclareAdapterRemovalSupport() {
-        LoadRealDxgi();
         return pReal_DXGIDeclareAdapterRemovalSupport ? pReal_DXGIDeclareAdapterRemovalSupport() : E_FAIL;
     }
 
@@ -204,12 +200,11 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
     if (ul_reason_for_call == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hModule);
         LoadRealDxgi();
-        if (MH_Initialize() == MH_OK) {
-            g_mhReady.store(true);
-        }
+        if (MH_Initialize() == MH_OK)
+            g_mhReady.store(true, std::memory_order_relaxed);
     }
     else if (ul_reason_for_call == DLL_PROCESS_DETACH) {
-        if (g_mhReady.load()) {
+        if (g_mhReady.load(std::memory_order_relaxed)) {
             MH_DisableHook(MH_ALL_HOOKS);
             MH_Uninitialize();
         }
