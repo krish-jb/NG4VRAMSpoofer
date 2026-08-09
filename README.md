@@ -16,6 +16,8 @@ The DLL acts as a proxy for `dxgi.dll`. When placed in a game's directory, Windo
 
 ## Installation
 
+> **⚠️ NOTE:** You can download the .dll file from [Releases](https://github.com/krish-jb/NG4VRAMSpoofer/releases/tag/v1.0.0)
+
 1. Build the project (see below)
 2. Rename the output `.dll` to `dxgi.dll`
 3. Copy it to the same folder as your game's `.exe`
