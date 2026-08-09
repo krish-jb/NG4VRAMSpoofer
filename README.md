@@ -41,7 +41,7 @@ dumpbin /imports game.exe | findstr dxgi
 ### Prerequisites
 
 - Visual Studio 2019 or later
-- [MinHook](https://github.com/TsudaKageworku/minhook) — you must build MinHook yourself and link it
+- [MinHook](https://github.com/tsudakageyu/minhook) — you must build MinHook yourself and link it
 
 ### Steps
 
